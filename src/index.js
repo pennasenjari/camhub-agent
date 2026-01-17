@@ -4,7 +4,9 @@ const os = require("os");
 const path = require("path");
 const fetch = require("node-fetch");
 
-const CAMHUB_URL = process.env.CAMHUB_URL || "http://localhost:8080";
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+
+const CAMHUB_URL = process.env.CAMHUB_URL || "http://localhost:3001";
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 const MEDIAMTX_RTSP_BASE = process.env.MEDIAMTX_RTSP_BASE || "rtsp://localhost:8554";
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 10000);
