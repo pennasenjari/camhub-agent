@@ -1,8 +1,12 @@
 const listEl = document.getElementById("cameras");
 const statusEl = document.getElementById("status");
 const refreshBtn = document.getElementById("refresh");
+const activePreviews = new Set();
 
-async function fetchCameras() {
+async function fetchCameras(force = false) {
+  if (!force && activePreviews.size > 0) {
+    return;
+  }
   statusEl.textContent = "Refreshing...";
   try {
     const res = await fetch("/api/cameras");
@@ -32,12 +36,26 @@ function renderCameras(cameras) {
       <div class="camera-meta">Stream: ${cam.streamPath}</div>
     `;
 
-    const status = document.createElement("span");
-    status.className = `pill ${cam.publishing ? "online" : "offline"}`;
-    status.textContent = cam.publishing ? "Publishing" : "Stopped";
+    const preview = document.createElement("div");
+    preview.className = "preview";
+    preview.innerHTML = `
+      <img alt="Preview" />
+    `;
+
+    function startPreview() {
+      const img = preview.querySelector("img");
+      img.src = `/api/preview?deviceUid=${encodeURIComponent(cam.deviceUid)}`;
+      preview.classList.add("active");
+    }
+
+    function stopPreview() {
+      const img = preview.querySelector("img");
+      img.removeAttribute("src");
+      preview.classList.remove("active");
+    }
 
     const toggle = document.createElement("button");
-    toggle.textContent = cam.enabled ? "Disable" : "Enable";
+    toggle.textContent = cam.enabled ? "Stop Streaming" : "Start Streaming";
     toggle.addEventListener("click", async () => {
       toggle.disabled = true;
       await fetch("/api/cameras/toggle", {
@@ -49,15 +67,36 @@ function renderCameras(cameras) {
       toggle.disabled = false;
     });
 
+    const previewBtn = document.createElement("button");
+    previewBtn.className = "ghost";
+    const previewActive = activePreviews.has(cam.deviceUid);
+    previewBtn.textContent = previewActive ? "Stop Preview" : "Start Preview";
+    previewBtn.addEventListener("click", () => {
+      if (preview.classList.contains("active")) {
+        stopPreview();
+        activePreviews.delete(cam.deviceUid);
+        previewBtn.textContent = "Start Preview";
+        return;
+      }
+      startPreview();
+      activePreviews.add(cam.deviceUid);
+      previewBtn.textContent = "Stop Preview";
+    });
+
     const actions = document.createElement("div");
     actions.className = "toggle";
-    actions.append(status, toggle);
+    actions.append(previewBtn, toggle);
 
-    card.append(info, actions);
+    card.append(info, preview, actions);
     listEl.append(card);
+
+    if (previewActive) {
+      startPreview();
+    }
+
   });
 }
 
-refreshBtn.addEventListener("click", fetchCameras);
-fetchCameras();
+refreshBtn.addEventListener("click", () => fetchCameras(true));
+fetchCameras(true);
 setInterval(fetchCameras, 10000);

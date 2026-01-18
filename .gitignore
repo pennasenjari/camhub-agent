@@ -14,3 +14,4 @@ data/
 !.env.example
 
 camhub-agent
+agent_state.json

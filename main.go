@@ -92,6 +92,7 @@ func main() {
 	mux.HandleFunc("/styles.css", serveCSS)
 	mux.HandleFunc("/api/cameras", agent.handleCameras)
 	mux.HandleFunc("/api/cameras/toggle", agent.handleToggle)
+	mux.HandleFunc("/api/preview", agent.handlePreviewStream)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -166,8 +167,8 @@ func (a *Agent) refreshCameras() {
 		deviceUID := fmt.Sprintf("%s:%s", a.hostname, device.Node)
 		enabled, ok := a.state[deviceUID]
 		if !ok {
-			enabled = true
-			a.state[deviceUID] = true
+			enabled = false
+			a.state[deviceUID] = false
 		}
 
 		camera := &Camera{
@@ -210,6 +211,9 @@ func (a *Agent) ensurePublisherLocked(camera *Camera) {
 		"-c:v", "libx264",
 		"-preset", "veryfast",
 		"-tune", "zerolatency",
+		"-g", "10",
+		"-keyint_min", "10",
+		"-sc_threshold", "0",
 		"-profile:v", "baseline",
 		"-level:v", "3.1",
 		"-pix_fmt", "yuv420p",
@@ -286,7 +290,7 @@ func (a *Agent) stopPublisherLocked(uid string) {
 
 func (a *Agent) registerCameras() {
 	a.mu.Lock()
-	var cams []map[string]string
+	cams := make([]map[string]string, 0)
 	for _, cam := range a.cameras {
 		if !cam.Enabled {
 			continue
@@ -383,6 +387,110 @@ func (a *Agent) handleToggle(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *Agent) handlePreviewStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	deviceUID := r.URL.Query().Get("deviceUid")
+	if deviceUID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "deviceUid required"})
+		return
+	}
+
+	a.mu.Lock()
+	cam := a.cameras[deviceUID]
+	a.mu.Unlock()
+	if cam == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "camera not found"})
+		return
+	}
+
+	logInfo("preview start %s", deviceUID)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "stream unsupported"})
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	args := []string{
+		"-f", "v4l2",
+		"-i", cam.Node,
+		"-vf", "fps=2,format=yuv420p",
+		"-q:v", "4",
+		"-f", "mjpeg",
+		"pipe:1",
+	}
+
+	cmd := exec.CommandContext(ctx, a.cfg.FfmpegPath, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preview failed"})
+		return
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preview failed"})
+		return
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+	w.WriteHeader(http.StatusOK)
+
+	const boundary = "--frame"
+	buf := make([]byte, 0, 8192)
+	tmp := make([]byte, 4096)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logInfo("preview stop %s", deviceUID)
+			return
+		default:
+		}
+
+		n, err := stdout.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			for {
+				start := bytes.Index(buf, []byte{0xFF, 0xD8})
+				if start < 0 {
+					if len(buf) > 2 {
+						buf = buf[len(buf)-2:]
+					}
+					break
+				}
+				if start > 0 {
+					buf = buf[start:]
+				}
+				end := bytes.Index(buf, []byte{0xFF, 0xD9})
+				if end < 0 {
+					break
+				}
+				frame := buf[:end+2]
+				buf = buf[end+2:]
+
+				_, _ = fmt.Fprintf(w, "%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", boundary, len(frame))
+				_, _ = w.Write(frame)
+				_, _ = w.Write([]byte("\r\n"))
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			logInfo("preview stream ended %s: %v", deviceUID, err)
+			return
+		}
+	}
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {
