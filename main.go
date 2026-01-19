@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,15 @@ type Config struct {
 	RestartDelay      time.Duration
 	RegisterUserAgent string
 	RegisterTimeout   time.Duration
+	MotionEnabled     bool
+	MotionSource      string
+	MotionFPS         int
+	MotionWidth       int
+	MotionHeight      int
+	MotionThreshold   float64
+	MotionConsecutive int
+	MotionCooldown    time.Duration
+	MotionTimeout     time.Duration
 }
 
 type DeviceInfo struct {
@@ -66,7 +76,12 @@ type Agent struct {
 	mu         sync.Mutex
 	cameras    map[string]*Camera
 	publishers map[string]*exec.Cmd
+	motions    map[string]*MotionWorker
 	state      map[string]bool
+}
+
+type MotionWorker struct {
+	cancel context.CancelFunc
 }
 
 func main() {
@@ -78,6 +93,7 @@ func main() {
 		hostname:   hostname,
 		cameras:    make(map[string]*Camera),
 		publishers: make(map[string]*exec.Cmd),
+		motions:    make(map[string]*MotionWorker),
 		state:      loadState(cfg.StateFile),
 	}
 
@@ -124,6 +140,15 @@ func loadConfig() Config {
 		RestartDelay:      getEnvDuration("RESTART_DELAY_MS", 2000*time.Millisecond),
 		RegisterUserAgent: getEnv("REGISTER_USER_AGENT", "camhub-agent/1.0"),
 		RegisterTimeout:   getEnvDuration("REGISTER_TIMEOUT_MS", 5000*time.Millisecond),
+		MotionEnabled:     getEnvBool("MOTION_ENABLED", false),
+		MotionSource:      getEnv("MOTION_SOURCE", "rtsp"),
+		MotionFPS:         getEnvInt("MOTION_FPS", 2),
+		MotionWidth:       getEnvInt("MOTION_WIDTH", 320),
+		MotionHeight:      getEnvInt("MOTION_HEIGHT", 240),
+		MotionThreshold:   getEnvFloat("MOTION_THRESHOLD", 12.0),
+		MotionConsecutive: getEnvInt("MOTION_CONSECUTIVE", 2),
+		MotionCooldown:    getEnvDuration("MOTION_COOLDOWN_MS", 10000*time.Millisecond),
+		MotionTimeout:     getEnvDuration("MOTION_TIMEOUT_MS", 3000*time.Millisecond),
 	}
 }
 
@@ -184,14 +209,17 @@ func (a *Agent) refreshCameras() {
 		next[deviceUID] = camera
 		if enabled {
 			a.ensurePublisherLocked(camera)
+			a.ensureMotionLocked(camera)
 		} else {
 			a.stopPublisherLocked(deviceUID)
+			a.stopMotionLocked(deviceUID)
 		}
 	}
 
 	for uid := range a.cameras {
 		if next[uid] == nil {
 			a.stopPublisherLocked(uid)
+			a.stopMotionLocked(uid)
 		}
 	}
 
@@ -286,6 +314,196 @@ func (a *Agent) stopPublisherLocked(uid string) {
 	if cam := a.cameras[uid]; cam != nil {
 		cam.Publishing = false
 	}
+}
+
+func (a *Agent) ensureMotionLocked(camera *Camera) {
+	if !a.cfg.MotionEnabled {
+		return
+	}
+	if a.motions[camera.DeviceUID] != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.motions[camera.DeviceUID] = &MotionWorker{cancel: cancel}
+
+	source := strings.ToLower(strings.TrimSpace(a.cfg.MotionSource))
+	if source == "" {
+		source = "rtsp"
+	}
+
+	go a.runMotionLoop(ctx, camera.DeviceUID, camera.Node, camera.StreamPath, source)
+}
+
+func (a *Agent) stopMotionLocked(uid string) {
+	worker := a.motions[uid]
+	if worker == nil {
+		return
+	}
+	worker.cancel()
+	delete(a.motions, uid)
+}
+
+func (a *Agent) runMotionLoop(ctx context.Context, deviceUID, node, streamPath, source string) {
+	width := a.cfg.MotionWidth
+	height := a.cfg.MotionHeight
+	if width <= 0 || height <= 0 {
+		logInfo("motion disabled for %s: invalid size %dx%d", deviceUID, width, height)
+		return
+	}
+
+	fps := a.cfg.MotionFPS
+	if fps <= 0 {
+		fps = 1
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		err := a.runMotionProcess(ctx, deviceUID, node, streamPath, source, fps, width, height)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			logInfo("motion process ended for %s: %v", deviceUID, err)
+		}
+		time.Sleep(a.cfg.RestartDelay)
+	}
+}
+
+func (a *Agent) runMotionProcess(ctx context.Context, deviceUID, node, streamPath, source string, fps, width, height int) error {
+	args := []string{}
+	if source == "device" {
+		args = append(args, "-f", "v4l2", "-i", node)
+	} else {
+		rtspURL := fmt.Sprintf("%s/%s", strings.TrimRight(a.cfg.MediaMtxRtspBase, "/"), streamPath)
+		args = append(args,
+			"-rtsp_transport", "tcp",
+			"-timeout", "5000000",
+			"-fflags", "nobuffer",
+			"-flags", "low_delay",
+			"-analyzeduration", "0",
+			"-probesize", "32",
+			"-i", rtspURL,
+		)
+	}
+
+	filter := fmt.Sprintf("fps=%d,scale=%d:%d,format=gray", fps, width, height)
+	args = append(args,
+		"-an",
+		"-vf", filter,
+		"-f", "rawvideo",
+		"-pix_fmt", "gray",
+		"pipe:1",
+	)
+
+	cmd := exec.CommandContext(ctx, a.cfg.FfmpegPath, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	defer func() {
+		_ = stdout.Close()
+		_ = cmd.Wait()
+	}()
+
+	frameSize := width * height
+	prev := make([]byte, frameSize)
+	buf := make([]byte, frameSize)
+
+	if _, err := io.ReadFull(stdout, prev); err != nil {
+		return err
+	}
+
+	threshold := a.cfg.MotionThreshold
+	consecutive := 0
+	lastEvent := time.Time{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if _, err := io.ReadFull(stdout, buf); err != nil {
+			return err
+		}
+
+		score := meanAbsDiff(prev, buf)
+		copy(prev, buf)
+
+		if score >= threshold {
+			consecutive++
+		} else {
+			consecutive = 0
+		}
+
+		if consecutive >= a.cfg.MotionConsecutive {
+			now := time.Now()
+			if lastEvent.IsZero() || now.Sub(lastEvent) >= a.cfg.MotionCooldown {
+				if err := a.sendMotionEvent(deviceUID, streamPath, now, score); err != nil {
+					logInfo("motion event failed for %s: %v", deviceUID, err)
+				}
+				lastEvent = now
+			}
+		}
+	}
+}
+
+func meanAbsDiff(a, b []byte) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var sum int64
+	for i := 0; i < len(a); i++ {
+		da := int(a[i])
+		db := int(b[i])
+		if da > db {
+			sum += int64(da - db)
+		} else {
+			sum += int64(db - da)
+		}
+	}
+	return float64(sum) / float64(len(a))
+}
+
+func (a *Agent) sendMotionEvent(deviceUID, streamPath string, ts time.Time, score float64) error {
+	payload := map[string]interface{}{
+		"deviceUid":  deviceUID,
+		"streamPath": streamPath,
+		"ts":         ts.UnixMilli(),
+		"score":      score,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(a.cfg.CamhubURL, "/")+"/api/motion", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", a.cfg.RegisterUserAgent)
+	if a.cfg.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.AuthToken)
+	}
+
+	client := &http.Client{Timeout: a.cfg.MotionTimeout}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		body, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("motion event rejected: %s", strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func (a *Agent) registerCameras() {
@@ -665,6 +883,36 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 		}
 		if n, err := parseInt(value); err == nil {
 			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
+		if n, err := strconv.ParseFloat(value, 64); err == nil {
+			return n
 		}
 	}
 	return fallback
